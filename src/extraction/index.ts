@@ -24,7 +24,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure, hasBashShebang, isPotentialBashShebangPath } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -173,6 +173,33 @@ export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
+/** Read only the shebang-sized prefix needed to classify extensionless shell scripts. */
+function fileHasBashShebang(absPath: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(256);
+    const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+    return hasBashShebang(buf.subarray(0, bytes).toString('utf-8'));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+/** Source-file predicate with content-backed Bash shebang support. */
+function isSourceFileAtPath(absPath: string, relativePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
+  if (isSourceFile(relativePath, overrides, rootDir)) return true;
+  return isPotentialBashShebangPath(relativePath) && fileHasBashShebang(absPath);
+}
+
+function detectLanguageForGrammarLoad(filePath: string, overrides?: Record<string, Language>, rootDir?: string): Language {
+  const lang = detectLanguage(filePath, undefined, overrides, rootDir);
+  return lang === 'unknown' && isPotentialBashShebangPath(filePath) ? 'bash' : lang;
+}
 
 /**
  * What change detection hashes for a file: its text when it is under the size
@@ -603,7 +630,7 @@ function collectIncludedFiles(
       if (defaults.ignores(rel)) return;
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
-      if (!isSourceFile(rel, overrides, rootDir)) return;
+      if (!isSourceFileAtPath(abs, rel, overrides, rootDir)) return;
       out.add(rel);
     }
   };
@@ -815,7 +842,7 @@ export function preloadLanguagesForFiles(
   overrides?: Record<string, Language>,
   rootDir?: string
 ): Language[] {
-  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
+  const languages = [...new Set(files.map((f) => detectLanguageForGrammarLoad(f, overrides, rootDir)))];
   // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
   if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
@@ -1360,7 +1387,9 @@ export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null)
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    const isSource = (filePath: string): boolean => isSourceFile(filePath, overrides, rootDir);
+    // Content-backed Bash shebang check so a changed extensionless script is
+    // seen the same way the full scan admits it.
+    const isSource = (filePath: string): boolean => isSourceFileAtPath(path.join(rootDir, filePath), filePath, overrides, rootDir);
     collectGitStatus(rootDir, '', changes, isSource, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
     return changes;
   } catch {
@@ -1462,7 +1491,10 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
   const classify = (statusCode: string, rel: string): void => {
     const filePath = normalizePath(prefix + rel);
-    if (!isSource(filePath)) return;
+    // A deleted extensionless Bash script has no content left to confirm its
+    // shebang, so deletions of potential-shebang paths pass through — the DB
+    // removal below acts only on paths already tracked there.
+    if (!isSource(filePath) && !(statusCode.includes('D') && isPotentialBashShebangPath(filePath))) return;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
@@ -1554,7 +1586,7 @@ export function scanDirectory(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides, rootDir)) {
+      if (isSourceFileAtPath(path.join(rootDir, filePath), filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1605,7 +1637,7 @@ export async function scanDirectoryAsync(
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides, rootDir)) {
+      if (isSourceFileAtPath(path.join(rootDir, filePath), filePath, overrides, rootDir)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1713,7 +1745,7 @@ function scanDirectoryWalk(
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
-              if (isSourceFile(relativePath, overrides, rootDir)) {
+              if (isSourceFileAtPath(fullPath, relativePath, overrides, rootDir)) {
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -1734,7 +1766,7 @@ function scanDirectoryWalk(
         }
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
-          if (isSourceFile(relativePath, overrides, rootDir)) {
+          if (isSourceFileAtPath(fullPath, relativePath, overrides, rootDir)) {
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
