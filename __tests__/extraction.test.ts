@@ -265,6 +265,56 @@ deploy "$@"
     expect(importRefs).toEqual(['./env.sh', './scripts/build.sh', './scripts/migrate.sh']);
   });
 
+  it('should parse case statements with the bundled Bash grammar', () => {
+    const code = `#!/usr/bin/env bash
+phase_file() {
+  case "$1" in
+    build) echo ./scripts/build.sh ;;
+    test) echo ./scripts/test.sh ;;
+  esac
+}
+`;
+
+    const result = extractFromSource('scripts/phase-file.sh', code);
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'phase_file')).toBeDefined();
+  });
+
+  it('should resolve canonical script-directory variables in sourced paths', () => {
+    const code = `#!/usr/bin/env bash
+S6_DIR=$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)
+source "$S6_DIR/../lib/atomic-write.sh"
+
+DYNAMIC_DIR="$HOME"
+source "$DYNAMIC_DIR/unsafe.sh"
+
+shadow_dir() {
+SHADOW_DIR=$(cd "$(dirname "$0")" && pwd)
+}
+source "$SHADOW_DIR/function-body.sh"
+
+cat <<'EOF'
+HEREDOC_DIR=$(cd "$(dirname "$0")" && pwd)
+EOF
+source "$HEREDOC_DIR/heredoc.sh"
+
+REASSIGNED_DIR=$(cd "$(dirname "$0")" && pwd)
+export REASSIGNED_DIR="$HOME"
+source "$REASSIGNED_DIR/reassigned.sh"
+`;
+
+    const result = extractFromSource('scripts/phases/s6_wire_local.sh', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+
+    expect(imports).toContain('../lib/atomic-write.sh');
+    expect(imports).not.toContain('../unsafe.sh');
+    expect(imports).not.toContain('$DYNAMIC_DIR/unsafe.sh');
+    expect(imports).not.toContain('./function-body.sh');
+    expect(imports).not.toContain('./heredoc.sh');
+    expect(imports).not.toContain('./reassigned.sh');
+  });
+
   it('should include extensionless Bash shebang scripts in directory scans', () => {
     const tempDir = createTempDir();
     try {

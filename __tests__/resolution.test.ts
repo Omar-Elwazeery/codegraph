@@ -567,7 +567,29 @@ describe('Resolution Module', () => {
       expect(result).toBe('src/helpers.ts');
     });
 
-    it('should resolve extensionless Bash imports to Bats scripts', () => {
+    it('should prefer an exact extensionless Bash path over a same-named Bats script', () => {
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: (p) => p === 'test/helpers/assertions' || p === 'test/helpers/assertions.bats',
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => ['test/helpers/assertions', 'test/helpers/assertions.bats'],
+      };
+
+      const result = resolveImportPath(
+        './helpers/assertions',
+        'test/integration.bats',
+        'bash',
+        context
+      );
+
+      expect(result).toBe('test/helpers/assertions');
+    });
+
+    it('should not guess a Bash file extension that the shell would not add', () => {
       const context: ResolutionContext = {
         getNodesInFile: () => [],
         getNodesByName: () => [],
@@ -586,7 +608,31 @@ describe('Resolution Module', () => {
         context
       );
 
-      expect(result).toBe('test/helpers/assertions.bats');
+      expect(result).toBeNull();
+    });
+
+    it('should resolve static Bash source and script paths to file imports edges', async () => {
+      fs.mkdirSync(path.join(tempDir, 'lib'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'tasks'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'main.sh'),
+        '#!/usr/bin/env bash\nsource ./lib/helpers.sh\nbash ./tasks/build.sh\n'
+      );
+      fs.writeFileSync(path.join(tempDir, 'lib', 'helpers.sh'), 'helper() { echo helper; }\n');
+      fs.writeFileSync(path.join(tempDir, 'tasks', 'build.sh'), 'build() { echo build; }\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const sourceFile = cg.getNodesInFile('main.sh').find((node) => node.kind === 'file');
+      const helperFile = cg.getNodesInFile('lib/helpers.sh').find((node) => node.kind === 'file');
+      const buildFile = cg.getNodesInFile('tasks/build.sh').find((node) => node.kind === 'file');
+      expect(sourceFile).toBeDefined();
+      expect(helperFile).toBeDefined();
+      expect(buildFile).toBeDefined();
+
+      const imports = cg.getOutgoingEdges(sourceFile!.id).filter((edge) => edge.kind === 'imports');
+      expect(imports.some((edge) => edge.target === helperFile!.id), 'source import edge missing').toBe(true);
+      expect(imports.some((edge) => edge.target === buildFile!.id), 'script import edge missing').toBe(true);
     });
 
     it('should extract JS/TS import mappings', () => {

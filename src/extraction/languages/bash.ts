@@ -1,4 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
+import * as path from 'path';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 
@@ -6,6 +7,21 @@ const SHELL_SOURCE_COMMANDS = new Set(['source', '.']);
 const SHELL_INTERPRETERS = new Set(['bash', 'sh']);
 const SHELL_WRAPPER_COMMANDS = new Set(['exec', 'command']);
 const SKIP_CALL_COMMANDS = new Set([':', '[', '[[', ']', ']]']);
+const SCRIPT_DIR_ASSIGNMENT = /^\$\(cd "\$\(dirname "(?:\$0|\$\{BASH_SOURCE\[0](?::-\$0)?})"\)((?:\/\.\.)*)" && pwd\)$/;
+const SCRIPT_DIR_PATH = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)}|([A-Za-z_][A-Za-z0-9_]*))(\/[A-Za-z0-9_.\/-]+)$/;
+// TreeSitterExtractor creates a fresh context wrapper for each visited node,
+// while the nodes array is stable for the lifetime of one file extraction.
+const bashStates = new WeakMap<object, Map<string, string>>();
+
+function getBashState(ctx: ExtractorContext): Map<string, string> {
+  const extraction = ctx.nodes as object;
+  let state = bashStates.get(extraction);
+  if (!state) {
+    state = new Map();
+    bashStates.set(extraction, state);
+  }
+  return state;
+}
 
 function commandName(node: SyntaxNode, source: string): string | null {
   const nameNode = getChildByField(node, 'name') || node.namedChildren.find((c) => c.type === 'command_name');
@@ -26,23 +42,66 @@ function commandArguments(node: SyntaxNode): SyntaxNode[] {
   return args;
 }
 
-function staticShellWord(node: SyntaxNode, source: string): string | null {
+function staticShellWord(node: SyntaxNode, ctx: ExtractorContext): string | null {
   // A plain `word` is static only when it has no expansion children. Quoted
   // strings are accepted when their content is literal; command/parameter
   // substitutions make the path dynamic and are deliberately skipped.
   if (node.type === 'word') {
-    const text = getNodeText(node, source).trim();
+    const text = getNodeText(node, ctx.source).trim();
     return /[$`{}()[\];"'<>]/.test(text) ? null : text;
   }
 
   if (node.type === 'raw_string' || node.type === 'string') {
-    if (node.namedChildren.some((c) => c.type !== 'string_content')) return null;
-    const text = getNodeText(node, source).trim();
+    const text = getNodeText(node, ctx.source).trim();
     const unquoted = text.replace(/^['"]|['"]$/g, '');
+    if (node.type === 'string' && text.startsWith('"') && text.endsWith('"')) {
+      const resolved = resolveCanonicalScriptDirectoryPath(unquoted, ctx);
+      if (resolved) return resolved;
+    }
+    if (node.namedChildren.some((c) => c.type !== 'string_content')) return null;
     return /[$`{}()[\];"'<>]/.test(unquoted) ? null : unquoted;
   }
 
   return null;
+}
+
+/**
+ * Fold only the canonical, deterministic "directory of this script" idiom:
+ *
+ *   DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ *   source "$DIR/../lib/helpers.sh"
+ *
+ * The assignment must be a direct child of the root program, precede the use,
+ * and match the idiom exactly. Arbitrary variables, nested assignments, and
+ * later reassignments remain dynamic and are deliberately skipped.
+ */
+function resolveCanonicalScriptDirectoryPath(value: string, ctx: ExtractorContext): string | null {
+  const expanded = SCRIPT_DIR_PATH.exec(value);
+  if (!expanded) return null;
+
+  const variable = expanded[1] ?? expanded[2]!;
+  const scriptDir = getBashState(ctx).get(variable);
+  if (scriptDir == null) return null;
+
+  const normalized = path.posix.normalize(`.${scriptDir}${expanded[3]}`);
+  return normalized.startsWith('../') ? normalized : `./${normalized}`;
+}
+
+/** Track only root-level canonical assignments; every other write invalidates. */
+function recordScriptDirectoryAssignment(assignment: SyntaxNode, ctx: ExtractorContext): void {
+  const name = assignmentName(assignment, ctx.source);
+  if (!name) return;
+
+  const state = getBashState(ctx);
+  state.delete(name);
+  if (assignment.parent?.type !== 'program') return;
+
+  const text = getNodeText(assignment, ctx.source).trim();
+  const prefix = `${name}=`;
+  if (!text.startsWith(prefix)) return;
+
+  const scriptDir = SCRIPT_DIR_ASSIGNMENT.exec(text.slice(prefix.length).trim());
+  if (scriptDir) state.set(name, scriptDir[1] ?? '');
 }
 
 function isStaticProjectPath(value: string): boolean {
@@ -96,7 +155,7 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   }
 
   const args = commandArguments(node);
-  const firstArg = args[0] ? staticShellWord(args[0], ctx.source) : null;
+  const firstArg = args[0] ? staticShellWord(args[0], ctx) : null;
 
   if (SHELL_SOURCE_COMMANDS.has(name)) {
     if (firstArg) emitImport(ctx, node, firstArg);
@@ -171,6 +230,7 @@ function handleDeclarationCommand(node: SyntaxNode, ctx: ExtractorContext): void
   const flags = declarationFlags(prefix);
 
   for (const assignment of assignments) {
+    recordScriptDirectoryAssignment(assignment, ctx);
     createAssignmentNode(assignment, ctx, flags.kind, flags.isExported);
   }
 
@@ -227,6 +287,7 @@ export const bashExtractor: LanguageExtractor = {
     }
 
     if (node.type === 'variable_assignment') {
+      recordScriptDirectoryAssignment(node, ctx);
       if (node.parent?.type !== 'declaration_command') {
         createAssignmentNode(node, ctx, 'variable');
       }

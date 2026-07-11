@@ -310,7 +310,10 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
     const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
       // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
-      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+      // tree-sitter-wasms build is too old). Bash: tree-sitter-wasms ships an
+      // ABI-13 build whose dynamic imports fail under web-tree-sitter 0.25 on
+      // common `case` statements; we vendor the official 0.25.1 ABI-15 WASM.
+      // Lua: tree-sitter-wasms ships an
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
       // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
@@ -332,7 +335,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // 0.25.10 (`generate` + `build --wasm`, ABI 15 — upstream's checked-in
       // parser.c is still ABI 13; all 54 upstream corpus tests pass on the
       // regenerated parser).
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'arkts' || lang === 'nix')
+      const wasmPath = (lang === 'bash' || lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol' || lang === 'vbnet' || lang === 'erlang' || lang === 'terraform' || lang === 'arkts' || lang === 'nix')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
