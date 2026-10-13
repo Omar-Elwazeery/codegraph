@@ -611,26 +611,22 @@ describe('Resolution Module', () => {
       expect(result).toBe('src/helpers.ts');
     });
 
-    it('should resolve extensionless Bash imports to Bats scripts', () => {
+    it('should resolve a Bash source path to the exact file, never adding an extension', () => {
+      const files = ['test/helpers/assertions', 'test/helpers/assertions.bats', 'test/helpers/only.bats'];
       const context: ResolutionContext = {
         getNodesInFile: () => [],
         getNodesByName: () => [],
         getNodesByQualifiedName: () => [],
         getNodesByKind: () => [],
-        fileExists: (p) => p === 'test/helpers/assertions.bats',
+        fileExists: (p) => files.includes(p),
         readFile: () => null,
         getProjectRoot: () => '',
-        getAllFiles: () => ['test/helpers/assertions.bats'],
+        getAllFiles: () => files,
       };
 
-      const result = resolveImportPath(
-        './helpers/assertions',
-        'test/integration.bats',
-        'bash',
-        context
-      );
-
-      expect(result).toBe('test/helpers/assertions.bats');
+      // A shell sources exactly the path it is given.
+      expect(resolveImportPath('./helpers/assertions', 'test/integration.bats', 'bash', context)).toBe('test/helpers/assertions');
+      expect(resolveImportPath('./helpers/only', 'test/integration.bats', 'bash', context)).toBeNull();
     });
 
     it('should extract JS/TS import mappings', () => {
